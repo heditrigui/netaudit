@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+.pytest_cache/
+# scan output may contain your network's details
+*.html
+*.json
+!docs/*.html
