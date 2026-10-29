@@ -27,7 +27,7 @@ Findings:
 ## Install
 
 ```bash
-pip install git+https://github.com/<your-username>/netaudit
+pip install git+https://github.com/heditrigui/netaudit
 netaudit update-oui    # optional, once: downloads the IEEE vendor list so MACs show manufacturers
 ```
 
@@ -71,7 +71,7 @@ Only scan networks you own or are authorized to test. By default `netaudit` refu
 ## Development
 
 ```bash
-git clone https://github.com/<your-username>/netaudit && cd netaudit
+git clone https://github.com/heditrigui/netaudit && cd netaudit
 pip install -e ".[dev]"
 pytest
 ```
