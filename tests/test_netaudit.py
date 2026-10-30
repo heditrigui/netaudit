@@ -76,7 +76,9 @@ def test_oui_registry_parsing():
 
 def test_http_parsing():
     raw = b"HTTP/1.0 200 OK\r\nServer: hccastsmartdisplay/1.0.0\r\n\r\n<html><title> Setup \n Page</title>"
-    assert portmod.parse_http(raw) == {"server": "hccastsmartdisplay/1.0.0", "title": "Setup Page"}
+    assert portmod.parse_http(raw) == {"status": "200", "server": "hccastsmartdisplay/1.0.0", "title": "Setup Page"}
+    redirect = portmod.parse_http(b"HTTP/1.1 302 Found\r\nLocation: https://192.168.1.1/\r\n\r\n")
+    assert redirect == {"status": "302", "location": "https://192.168.1.1/"}
 
 
 def test_rules_and_score():
@@ -240,3 +242,88 @@ def test_history_command_and_html_section(monkeypatch, capsys, tmp_path):
     assert cli.main(["history", "10.9.9.9"]) == 1
     assert cli.main(["scan", "192.168.1.0/24", "-q", "--no-history"]) == 0
     assert history.load()["devices"]["00:12:34:56:78:9A"]["seen"] == 2
+
+
+def test_parse_gateway_on_each_platform():
+    win = "Network Destination        Netmask          Gateway       Interface  Metric\n" \
+          "          0.0.0.0          0.0.0.0      192.168.1.1    192.168.1.100     25\n"
+    bsd = "   route to: default\ndestination: default\n    gateway: 10.0.0.1\n  interface: en0\n"
+    proc = "Iface\tDestination\tGateway \tFlags\nwlan0\t0001A8C0\t00000000\t0001\nwlan0\t00000000\t0101A8C0\t0003\n"
+    assert discover.parse_gateway(win) == "192.168.1.1"
+    assert discover.parse_gateway(bsd) == "10.0.0.1"
+    assert discover.parse_gateway(proc) == "192.168.1.1"
+    assert discover.parse_gateway("nothing here") == ""
+
+
+def test_ssdp_responses_are_merged_per_host():
+    found = {}
+    igd = (b"HTTP/1.1 200 OK\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n"
+           b"LOCATION: http://192.168.1.1:5000/rootDesc.xml\r\nSERVER: Linux/3.4 UPnP/1.0 MiniUPnPd/1.8\r\n"
+           b"USN: uuid:abc::urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n")
+    wfa = b"HTTP/1.1 200 OK\r\nST: urn:schemas-wifialliance-org:device:WFADevice:1\r\n\r\n"
+    discover._merge_ssdp(found, "192.168.1.1", discover.parse_ssdp(igd))
+    discover._merge_ssdp(found, "192.168.1.1", discover.parse_ssdp(wfa))
+    entry = found["192.168.1.1"]
+    assert entry["location"] == "http://192.168.1.1:5000/rootDesc.xml"
+    assert entry["types"] == ["urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+                              "urn:schemas-wifialliance-org:device:WFADevice:1"]
+
+
+class _HTTPStub(threading.Thread):
+    """Serve one fixed HTTP response to every connection on 127.0.0.1."""
+
+    def __init__(self, response: bytes):
+        super().__init__(daemon=True)
+        self.response = response
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen()
+        self.port = self.sock.getsockname()[1]
+
+    def run(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            with conn:
+                conn.recv(1024)
+                conn.sendall(self.response)
+
+
+def test_upnp_description_is_read_only_from_the_device_itself():
+    xml = (b"<root><device><deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>"
+           b"<friendlyName>Home Router</friendlyName><manufacturer>Example &amp; Co</manufacturer>"
+           b"<modelName>XR-500</modelName><modelNumber>V1.0.3.88</modelNumber>"
+           b"<serviceType>urn:schemas-wifialliance-org:service:WFAWLANConfig:1</serviceType></device></root>")
+    stub = _HTTPStub(b"HTTP/1.0 200 OK\r\nContent-Type: text/xml\r\n\r\n" + xml)
+    stub.start()
+    desc = discover.describe_upnp("127.0.0.1", f"http://127.0.0.1:{stub.port}/rootDesc.xml")
+    stub.sock.close()
+    assert desc["manufacturer"] == "Example & Co" and desc["model_number"] == "V1.0.3.88"
+    assert "urn:schemas-wifialliance-org:service:WFAWLANConfig:1" in desc["types"]
+    # A LOCATION pointing anywhere else is never fetched.
+    assert discover.describe_upnp("127.0.0.1", "http://192.0.2.10/rootDesc.xml") == {}
+
+
+def test_router_checks():
+    router = Device(ip="192.168.1.1", gateway=True, open_ports=[53, 80],
+                    services={80: {"status": "200", "server": "RomPager/4.07 UPnP/1.0"}},
+                    upnp={"server": "Linux/3.4 UPnP/1.0 MiniUPnPd/1.8", "model_number": "V1.0.3.88",
+                          "types": ["urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+                                    "urn:schemas-wifialliance-org:device:WFADevice:1"]})
+    router.kind = risks.guess_kind(router)
+    titles = {f.title: f.severity for f in risks.evaluate(router)}
+    assert router.kind == "Router / gateway"
+    assert titles["UPnP port forwarding (IGD) is enabled"] == "medium"
+    assert titles["WPS appears to be enabled"] == "medium"
+    assert titles["Router admin page is reachable over plain HTTP"] == "medium"
+    assert "Admin page only over plain HTTP" not in titles  # no duplicate of the generic rule
+    assert titles["RomPager 4.x web server (Misfortune Cookie): RomPager/4.07 UPnP/1.0"] == "critical"
+    assert any(t.startswith("Old MiniUPnP daemon") for t in titles)
+    assert titles["Software version visible: UPnP: V1.0.3.88"] == "info"
+
+    safe = Device(ip="192.168.1.1", gateway=True, open_ports=[80, 443],
+                  services={80: {"status": "301", "location": "https://192.168.1.1/"}})
+    safe.kind = risks.guess_kind(safe)
+    assert risks.evaluate(safe) == []

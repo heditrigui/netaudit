@@ -15,8 +15,9 @@ from netaudit import ports as portmod
 from netaudit.risks import Device, evaluate, guess_kind
 
 
-def audit_host(ip: str, mac: str, port_spec: list[int], timeout: float, no_dns: bool) -> Device:
-    dev = Device(ip=ip, mac=mac, vendor=oui.vendor(mac))
+def audit_host(ip: str, mac: str, port_spec: list[int], timeout: float, no_dns: bool,
+               upnp: dict | None = None, gateway: str = "") -> Device:
+    dev = Device(ip=ip, mac=mac, vendor=oui.vendor(mac), gateway=ip == gateway)
     if not no_dns:
         dev.hostname = discover.reverse_dns(ip)
     dev.open_ports = portmod.scan(ip, port_spec, timeout=timeout)
@@ -24,6 +25,9 @@ def audit_host(ip: str, mac: str, port_spec: list[int], timeout: float, no_dns: 
         info = portmod.grab_banner(ip, p)
         if info:
             dev.services[p] = info
+    if upnp:
+        desc = discover.describe_upnp(ip, upnp.get("location", ""))
+        dev.upnp = {**upnp, **desc, "types": list(dict.fromkeys(upnp["types"] + desc.get("types", [])))}
     dev.kind = guess_kind(dev)
     dev.findings = evaluate(dev)
     return dev
@@ -33,13 +37,18 @@ def run_scan(net: ipaddress.IPv4Network, port_spec: list[int], args: argparse.Na
     """Discover, scan and evaluate every host; shared by `scan` and `watch`."""
     log(f"Discovering hosts on {net} ...")
     hosts = discover.sweep(net, timeout=args.timeout, workers=args.workers)
-    arp = discover.arp_table()
     self_ip = discover.local_ip()
+    ssdp = {} if args.no_upnp else discover.ssdp_search(local=self_ip)
+    ssdp = {ip: v for ip, v in ssdp.items() if ipaddress.ip_address(ip) in net}
+    hosts = sorted(set(hosts) | set(ssdp), key=ipaddress.ip_address)
+    arp = discover.arp_table()
+    gateway = discover.default_gateway()
     log(f"Found {len(hosts)} host(s). Scanning {len(port_spec)} port(s) each ...")
 
     with ThreadPoolExecutor(max_workers=16) as pool:
         devices = list(pool.map(
-            lambda ip: audit_host(ip, arp.get(ip, ""), port_spec, args.timeout, args.no_dns), hosts
+            lambda ip: audit_host(ip, arp.get(ip, ""), port_spec, args.timeout, args.no_dns, ssdp.get(ip), gateway),
+            hosts,
         ))
     names = store.load_names()
     for d in devices:
@@ -175,6 +184,7 @@ def _add_scan_args(s: argparse.ArgumentParser) -> None:
     s.add_argument("--timeout", type=float, default=0.8, help="per-connection timeout in seconds (default 0.8)")
     s.add_argument("--workers", type=int, default=128, help="parallel discovery probes (default 128)")
     s.add_argument("--no-dns", action="store_true", help="skip reverse DNS lookups")
+    s.add_argument("--no-upnp", action="store_true", help="skip UPnP/SSDP discovery and the router UPnP checks")
     s.add_argument("--allow-public", action="store_true", help="allow scanning non-private ranges you are authorized to test")
     s.add_argument("--force", action="store_true", help=f"allow ranges larger than {discover.MAX_HOSTS} addresses")
     s.add_argument("-q", "--quiet", action="store_true", help="only print the results")

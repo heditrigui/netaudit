@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import ctypes
+import html
 import ipaddress
 import platform
 import re
 import socket
 import subprocess
 import threading
+import time
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
+
+from netaudit import ports
 
 # Ports that answer on almost every kind of device; a connect (or a refusal) proves the host is up.
 _LIVENESS_PORTS = (80, 443, 22, 445, 139, 53, 8080, 62078, 5000, 554)
@@ -172,3 +177,109 @@ def reverse_dns(ip: str) -> str:
     except (OSError, UnicodeError):
         return ""
     return "" if name == ip else name
+
+
+_WIN_ROUTE = re.compile(r"^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+(\d+\.\d+\.\d+\.\d+)", re.M)
+_BSD_ROUTE = re.compile(r"^\s*gateway:\s*(\d+\.\d+\.\d+\.\d+)", re.M)
+_PROC_ROUTE = re.compile(r"^\S+[ \t]+00000000[ \t]+([0-9A-Fa-f]{8})\s", re.M)
+
+
+def parse_gateway(text: str) -> str:
+    """Find the default gateway in `route print`, `route -n get default` or /proc/net/route output."""
+    if m := _PROC_ROUTE.search(text):
+        gw = socket.inet_ntoa(int(m.group(1), 16).to_bytes(4, "little"))
+        if gw != "0.0.0.0":
+            return gw
+    for pattern in (_WIN_ROUTE, _BSD_ROUTE):
+        if m := pattern.search(text):
+            return m.group(1)
+    return ""
+
+
+def default_gateway() -> str:
+    try:
+        with open("/proc/net/route", encoding="ascii") as fh:
+            return parse_gateway(fh.read())
+    except OSError:
+        pass
+    cmd = ["route", "print", "-4", "0.0.0.0"] if _WINDOWS else ["route", "-n", "get", "default"]
+    try:
+        return parse_gateway(subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+# SSDP (UPnP discovery). Routers that answer for InternetGatewayDevice let any LAN device open
+# ports to the internet; WFADevice means WPS is offered to "external registrars" over UPnP.
+SSDP_ADDR = ("239.255.255.250", 1900)
+_SSDP_TARGETS = (
+    "ssdp:all",
+    "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+    "urn:schemas-wifialliance-org:device:WFADevice:1",
+)
+
+
+def parse_ssdp(data: bytes) -> dict[str, str]:
+    headers = {}
+    for line in data.decode("utf-8", "replace").splitlines()[1:]:
+        key, sep, value = line.partition(":")
+        if sep:
+            headers[key.strip().lower()] = value.strip()
+    return headers
+
+
+def _merge_ssdp(found: dict[str, dict], ip: str, headers: dict[str, str]) -> None:
+    entry = found.setdefault(ip, {"server": "", "location": "", "types": []})
+    for k in ("server", "location"):
+        entry[k] = entry[k] or headers.get(k, "")
+    for t in (headers.get("st", ""), headers.get("usn", "").partition("::")[2]):
+        if t.startswith("urn:") and t not in entry["types"]:
+            entry["types"].append(t)
+
+
+def ssdp_search(timeout: float = 2.0, local: str = "") -> dict[str, dict]:
+    """Multicast an M-SEARCH on the local segment and collect who answers: {ip: {server, location, types}}."""
+    found: dict[str, dict] = {}
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            if local and local != "127.0.0.1":
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(local))
+            s.settimeout(0.3)
+            for st in _SSDP_TARGETS:
+                msg = (f"M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\n"
+                       f"MX: 1\r\nST: {st}\r\n\r\n")
+                s.sendto(msg.encode(), SSDP_ADDR)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    data, (ip, _port) = s.recvfrom(4096)
+                except socket.timeout:
+                    continue
+                _merge_ssdp(found, ip, parse_ssdp(data))
+    except OSError:
+        pass
+    return found
+
+
+_UPNP_FIELDS = {"friendlyName": "friendly_name", "manufacturer": "manufacturer",
+                "modelName": "model_name", "modelNumber": "model_number"}
+_UPNP_TYPE = re.compile(r"urn:schemas-[\w.-]+:(?:device|service):[\w.-]+:\d+")
+
+
+def describe_upnp(ip: str, location: str, timeout: float = 3.0) -> dict:
+    """Read the UPnP device description (model, firmware number, services), only from the device itself."""
+    url = urllib.parse.urlsplit(location)
+    if url.scheme != "http" or url.hostname != ip:
+        return {}
+    try:
+        raw = ports.http_get(ip, url.port or 80, url.path or "/", timeout=timeout)
+    except OSError:
+        return {}
+    body = raw.partition(b"\r\n\r\n")[2].decode("utf-8", "replace")
+    out: dict = {}
+    for tag, key in _UPNP_FIELDS.items():
+        if m := re.search(rf"<{tag}>\s*([^<]{{1,120}}?)\s*</{tag}>", body):
+            out[key] = html.unescape(m.group(1))
+    out["types"] = list(dict.fromkeys(_UPNP_TYPE.findall(body)))
+    return out

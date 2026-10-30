@@ -63,12 +63,18 @@ def scan(ip: str, ports: list[int], timeout: float = 0.8, workers: int = 200) ->
         return [p for p, up in results if up]
 
 
+_STATUS = re.compile(rb"^HTTP/\d(?:\.\d)?\s+(\d{3})")
+_LOCATION = re.compile(rb"^location:\s*(.+?)\r?$", re.I | re.M)
 _TITLE = re.compile(rb"<title[^>]*>(.*?)</title>", re.I | re.S)
 _SERVER = re.compile(rb"^server:\s*(.+?)\r?$", re.I | re.M)
 
 
 def parse_http(raw: bytes) -> dict[str, str]:
     info: dict[str, str] = {}
+    if m := _STATUS.match(raw):
+        info["status"] = m.group(1).decode()
+    if m := _LOCATION.search(raw):
+        info["location"] = m.group(1).decode("latin-1").strip()[:200]
     if m := _SERVER.search(raw):
         info["server"] = m.group(1).decode("latin-1").strip()
     if m := _TITLE.search(raw):
