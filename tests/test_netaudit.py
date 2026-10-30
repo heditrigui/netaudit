@@ -5,7 +5,7 @@ from datetime import datetime
 
 import pytest
 
-from netaudit import cli, discover, history, oui, report, risks, store
+from netaudit import cli, discover, history, notify, oui, report, risks, store, watch
 from netaudit import ports as portmod
 from netaudit.risks import Device, Finding
 
@@ -327,3 +327,148 @@ def test_router_checks():
                   services={80: {"status": "301", "location": "https://192.168.1.1/"}})
     safe.kind = risks.guess_kind(safe)
     assert risks.evaluate(safe) == []
+
+
+def test_parse_interval():
+    assert watch.parse_interval("15m") == 900
+    assert watch.parse_interval("1h") == 3600
+    assert watch.parse_interval("90s") == 90
+    assert watch.parse_interval("5") == 300  # bare number = minutes
+    for bad in ("10s", "soon", "-5m"):
+        with pytest.raises(ValueError):
+            watch.parse_interval(bad)
+
+
+def _dev(ip, mac="", ports=(), findings=()):
+    return {"ip": ip, "mac": mac, "name": "", "hostname": "", "vendor": "", "open_ports": list(ports),
+            "findings": [{"severity": s, "title": t} for s, t in findings]}
+
+
+def test_detect_changes():
+    old = [
+        _dev("192.168.1.10", "00:11:22:33:44:01", [80]),
+        _dev("192.168.1.11", "00:11:22:33:44:02"),
+        _dev("192.168.1.12", "00:11:22:33:44:03"),
+    ]
+    new = [
+        _dev("192.168.1.10", "00:11:22:33:44:01", [80, 23], [("critical", "Telnet is open")]),  # new port + finding
+        _dev("192.168.1.21", "00:11:22:33:44:02"),                     # same MAC, new IP
+        _dev("192.168.1.12", "00:11:22:33:44:99"),                     # same IP, different MAC
+        _dev("192.168.1.11", "00:AA:BB:CC:DD:EE", [5555]),            # someone new on a reused IP
+        _dev("192.168.1.50", "", [], [("info", "Software version visible: x 1.0")]),
+    ]
+    events = watch.detect_changes(old, new)
+    kinds = sorted((e["kind"], e["ip"]) for e in events)
+    assert kinds == [
+        ("ip_changed", "192.168.1.21"), ("mac_changed", "192.168.1.12"),
+        ("new_device", "192.168.1.11"), ("new_device", "192.168.1.50"),
+        ("new_finding", "192.168.1.10"), ("new_port", "192.168.1.10"),
+    ]
+    assert not any("Software version" in e["text"] for e in events)  # info is never alerted
+    assert [e["kind"] for e in watch.detect_changes(old, new, "critical") if e["ip"] == "192.168.1.10"] == \
+        ["new_port", "new_finding"]
+    subject, body = watch.format_alert("192.168.1.0/24", events)
+    assert subject == "netaudit: 6 change(s) on 192.168.1.0/24" and body.count("\n") == 5
+
+
+def test_alert_config_from_file_and_env(tmp_path, monkeypatch):
+    ini = tmp_path / "alerts.ini"
+    ini.write_text("[telegram]\ntoken = file-token\nchat_id = 42\n[email]\nhost = smtp.example.test\nto = a@example.test\n")
+    monkeypatch.setenv("NETAUDIT_TELEGRAM_TOKEN", "env-token")
+    monkeypatch.setenv("NETAUDIT_DISCORD_WEBHOOK", "https://discord.example.test/api/webhooks/1/x")
+    cfg = notify.load_config(str(ini))
+    assert cfg["telegram"] == {"token": "env-token", "chat_id": "42"}
+    assert [name for name, _ in notify.channels(cfg)] == ["telegram", "discord", "email"]
+    with pytest.raises(FileNotFoundError):
+        notify.load_config(str(tmp_path / "missing.ini"))
+
+
+def test_telegram_and_discord_requests(monkeypatch):
+    sent = []
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    monkeypatch.setattr(notify.urllib.request, "urlopen", lambda req, timeout: sent.append(req) or Resp())
+    notify.send_telegram("T0K", "42", "hello")
+    notify.send_discord("https://discord.example.test/api/webhooks/1/x", "x" * 3000)
+    tg, dc = sent
+    assert tg.full_url == "https://api.telegram.org/botT0K/sendMessage" and b"chat_id=42" in tg.data
+    body = json.loads(dc.data)
+    assert len(body["content"]) == 2000 and dc.get_header("User-agent").startswith("netaudit/")
+
+
+def test_email_alert_uses_starttls_and_login(monkeypatch):
+    calls = []
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout):
+            calls.append(("connect", host, port))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def starttls(self, context):
+            calls.append(("starttls",))
+
+        def login(self, user, password):
+            calls.append(("login", user))
+
+        def send_message(self, msg):
+            calls.append(("send", msg["To"], msg["Subject"]))
+
+    monkeypatch.setattr(notify.smtplib, "SMTP", FakeSMTP)
+    notify.send_email({"host": "smtp.example.test", "user": "me@example.test", "password": "pw",
+                       "to": "a@example.test, b@example.test"}, "subj", "body")
+    assert calls == [("connect", "smtp.example.test", 587), ("starttls",), ("login", "me@example.test"),
+                     ("send", "a@example.test, b@example.test", "subj")]
+
+
+def test_send_all_reports_failures_without_stopping():
+    got = []
+
+    def boom(subject, body):
+        raise OSError("no route")
+
+    errors = notify.send_all([("discord", boom), ("telegram", lambda s, b: got.append(s))], "s", "b")
+    assert errors == ["discord: no route"] and got == ["s"]
+
+
+def test_watch_alerts_on_second_scan(monkeypatch, capsys):
+    scans = iter([
+        [{"ip": "192.168.1.10", "mac": "00:11:22:33:44:01", "open_ports": [80]}],
+        [{"ip": "192.168.1.10", "mac": "00:11:22:33:44:01", "open_ports": [80, 23]},
+         {"ip": "192.168.1.66", "mac": "00:11:22:33:44:66"}],
+    ])
+    monkeypatch.setattr(cli, "run_scan", lambda *a: _fake_scan(next(scans))(*a))
+    sleeps, alerts = [], []
+    monkeypatch.setattr(cli.time, "sleep", sleeps.append)
+    monkeypatch.setattr(notify, "channels", lambda cfg: [("test", lambda s, b: alerts.append((s, b)))])
+    assert cli.main(["watch", "192.168.1.0/24", "--every", "15m", "--count", "2", "-q"]) == 0
+    assert len(sleeps) == 1 and 0 < sleeps[0] <= 900
+    (subject, body), = alerts
+    assert "3 change(s)" in subject
+    assert "opened port(s) 23" in body and "Telnet is open" in body and "New device 192.168.1.66" in body
+    assert "Baseline recorded" in capsys.readouterr().err
+    assert watch.state_path("192.168.1.0/24").exists()
+    assert history.load()["devices"]["00:11:22:33:44:01"]["seen"] == 2
+
+
+def test_watch_refuses_public_ranges_and_short_intervals(capsys):
+    assert cli.main(["watch", "8.8.8.0/24", "--count", "1"]) == 2
+    assert cli.main(["watch", "192.168.1.0/24", "--every", "5s", "--count", "1"]) == 2
+
+
+def test_test_alerts_without_config(capsys):
+    assert cli.main(["test-alerts"]) == 1
+    assert "No alert channels configured" in capsys.readouterr().err

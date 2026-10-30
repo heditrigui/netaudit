@@ -9,8 +9,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 
-from netaudit import __version__, discover, history, oui, report, store
+from netaudit import __version__, discover, history, notify, oui, report, store, watch
 from netaudit import ports as portmod
 from netaudit.risks import Device, evaluate, guess_kind
 
@@ -105,6 +106,82 @@ def cmd_scan(args: argparse.Namespace) -> int:
         if any(f.severity in blocking for d in devices for f in d.findings):
             return 1
     return 0
+
+
+def _senders(args: argparse.Namespace):
+    return notify.channels(notify.load_config(args.config))
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    try:
+        net, port_spec = _scope(args)
+        interval = watch.parse_interval(args.every)
+        senders = _senders(args)
+    except (discover.ScopeError, ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    log = _logger(args)
+
+    def say(*a):  # status lines that --quiet keeps
+        print(*a, file=sys.stderr)
+
+    if senders:
+        say(f"Alerts go to: {', '.join(name for name, _ in senders)}")
+    else:
+        say(f"No alert channels configured ({notify.config_path()} or NETAUDIT_* variables); changes are only printed.")
+
+    state = watch.state_path(str(net))
+    previous = store.read_json(state, None)
+    runs = 0
+    while True:
+        started = datetime.now()
+        t0 = time.monotonic()
+        devices = run_scan(net, port_spec, args, log)
+        hist = None
+        if not args.no_history:
+            hist = history.load()
+            history.record(hist, devices, started, str(net))
+            history.save(hist)
+        current = report.to_json(str(net), devices, started)
+        stamp = f"{started:%Y-%m-%d %H:%M}"
+        if previous is None:
+            say(f"[{stamp}] Baseline recorded: {len(devices)} device(s). Watching for changes every {args.every}.")
+        else:
+            events = watch.detect_changes(previous["devices"], current["devices"], args.min_severity)
+            if events:
+                subject, body = watch.format_alert(str(net), events)
+                print(f"[{stamp}] {subject}\n{body}", flush=True)
+                for err in notify.send_all(senders, subject, body):
+                    say(f"alert failed: {err}")
+            else:
+                say(f"[{stamp}] No changes ({len(devices)} device(s)).")
+        store.write_json(state, current)
+        previous = current
+        if args.json:
+            store.write_json(Path(args.json), current)
+        if args.html:
+            Path(args.html).write_text(report.to_html(str(net), devices, started, None, hist), encoding="utf-8")
+        runs += 1
+        if args.count and runs >= args.count:
+            return 0
+        time.sleep(max(0.0, interval - (time.monotonic() - t0)))
+
+
+def cmd_test_alerts(args: argparse.Namespace) -> int:
+    try:
+        senders = _senders(args)
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if not senders:
+        print(f"No alert channels configured. Create {notify.config_path()} or set NETAUDIT_* variables (see README).",
+              file=sys.stderr)
+        return 1
+    errors = notify.send_all(senders, "netaudit test alert", "If you can read this, netaudit watch alerts work.")
+    for name, _ in senders:
+        failed = [e for e in errors if e.startswith(name + ":")]
+        print(f"{name}: {'FAILED - ' + failed[0].split(': ', 1)[1] if failed else 'sent'}")
+    return 1 if errors else 0
 
 
 def cmd_name(args: argparse.Namespace) -> int:
@@ -207,6 +284,19 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("name", nargs="?", help='the friendly name, e.g. "Living room TV"')
     n.add_argument("--remove", action="store_true", help="forget the name for this device")
     n.set_defaults(func=cmd_name)
+
+    w = sub.add_parser("watch", help="rescan on a schedule and alert on new devices, ports and findings")
+    _add_scan_args(w)
+    w.add_argument("--every", default="15m", help="time between scans, e.g. 90s, 15m, 1h (default 15m, minimum 60s)")
+    w.add_argument("--config", metavar="FILE", help=f"alert settings (default {notify.config_path()})")
+    w.add_argument("--min-severity", choices=["critical", "high", "medium", "low"], default="low",
+                   help="lowest severity of new findings to alert on (default low)")
+    w.add_argument("--count", type=int, default=0, help="stop after this many scans (default: run until Ctrl+C)")
+    w.set_defaults(func=cmd_watch)
+
+    t = sub.add_parser("test-alerts", help="send a test message to every configured alert channel")
+    t.add_argument("--config", metavar="FILE", help=f"alert settings (default {notify.config_path()})")
+    t.set_defaults(func=cmd_test_alerts)
 
     h = sub.add_parser("history", help="show every device seen so far, or one device's timeline")
     h.add_argument("device", nargs="?", help="IP, MAC or friendly name")
