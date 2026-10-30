@@ -25,6 +25,7 @@ class Device:
     mac: str = ""
     vendor: str = ""
     hostname: str = ""
+    name: str = ""  # friendly name set with `netaudit name`
     open_ports: list[int] = field(default_factory=list)
     services: dict[int, dict[str, str]] = field(default_factory=dict)
     kind: str = ""

@@ -18,6 +18,14 @@ def _port_label(p: int) -> str:
     return f"{p}/{name}" if name else str(p)
 
 
+def _name_cell(d: Device) -> str:
+    e = html.escape
+    if d.name:
+        sub = " &middot; ".join(e(x) for x in (d.hostname, d.vendor) if x)
+        return f"<b>{e(d.name)}</b><br><span class='muted'>{sub}</span>"
+    return f"{e(d.hostname or '-')}<br><span class='muted'>{e(d.vendor or '')}</span>"
+
+
 def device_key(d: dict) -> str:
     """Identify a device across scans: by MAC when it is a real one, else by IP."""
     mac = d.get("mac") or ""
@@ -55,7 +63,7 @@ def console(network: str, devices: list[Device], changes: dict | None = None) ->
     lines = [f"\nnetaudit - {network} - {len(devices)} device(s)\n"]
     rows = [("", "IP", "MAC", "VENDOR / NAME", "TYPE", "OPEN PORTS", "SCORE")]
     for d in devices:
-        name = d.hostname or d.vendor
+        name = d.name or d.hostname or d.vendor
         rows.append((
             ICON[d.worst], d.ip, d.mac or "-", (name or "-")[:28], (d.kind or "-")[:26],
             ", ".join(_port_label(p) for p in d.open_ports)[:40] or "-", str(d.score),
@@ -113,7 +121,7 @@ def to_html(network: str, devices: list[Device], started: datetime, changes: dic
         ) or "<span class='muted'>None</span>"
         rows.append(
             f"<tr><td><b>{e(d.ip)}</b><br><code class='muted'>{e(d.mac or '-')}</code></td>"
-            f"<td>{e(d.hostname or '-')}<br><span class='muted'>{e(d.vendor or '')}</span></td>"
+            f"<td>{_name_cell(d)}</td>"
             f"<td>{e(d.kind or '-')}</td>"
             f"<td>{e(', '.join(_port_label(p) for p in d.open_ports) or '-')}</td>"
             f"<td><ul>{findings}</ul></td>"

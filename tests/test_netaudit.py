@@ -5,9 +5,16 @@ from datetime import datetime
 
 import pytest
 
-from netaudit import discover, oui, report, risks
+from netaudit import cli, discover, oui, report, risks, store
 from netaudit import ports as portmod
 from netaudit.risks import Device, Finding
+
+@pytest.fixture(autouse=True)
+def data_home(tmp_path, monkeypatch):
+    """Keep names, history and watch state out of the real data folder."""
+    monkeypatch.setenv("NETAUDIT_HOME", str(tmp_path / "home"))
+    return tmp_path / "home"
+
 
 WIN_ARP = """
 Interface: 192.168.1.100 --- 0x12
@@ -147,3 +154,48 @@ def test_scan_banner_and_hccast_probe(monkeypatch):
     titles = [f.title for f in risks.evaluate(dev)]
     assert "Default Wi-Fi Direct password" in titles
     stub.sock.close()
+
+
+def test_normalize_target():
+    assert store.normalize_target("00-1a-2b-3c-4d-ee") == "00:1A:2B:3C:4D:EE"
+    assert store.normalize_target("192.168.1.238") == "192.168.1.238"
+    with pytest.raises(ValueError):
+        store.normalize_target("projector")
+
+
+def test_name_command_prefers_mac_and_renames(monkeypatch, capsys):
+    monkeypatch.setattr(discover, "arp_table", lambda: {"192.168.1.238": "00:1A:2B:3C:4D:EE"})
+    assert cli.main(["name", "192.168.1.238", "Projector"]) == 0
+    assert store.load_names() == {"00:1A:2B:3C:4D:EE": "Projector"}
+    assert cli.main(["name", "projector", "Living room projector"]) == 0
+    assert store.load_names() == {"00:1A:2B:3C:4D:EE": "Living room projector"}
+    assert cli.main(["name", "192.168.1.50", "NAS"]) == 0  # no MAC known: keyed by IP
+    assert store.lookup_name(store.load_names(), "", "192.168.1.50") == "NAS"
+    capsys.readouterr()
+    assert cli.main(["name"]) == 0
+    assert "Living room projector" in capsys.readouterr().out
+    assert cli.main(["name", "NAS", "--remove"]) == 0
+    assert "192.168.1.50" not in store.load_names()
+
+
+def _fake_scan(devices):
+    def run_scan(net, port_spec, args, log):
+        names = store.load_names()
+        out = [Device(**{k: v for k, v in d.items()}) for d in devices]
+        for d in out:
+            d.kind = d.kind or risks.guess_kind(d)
+            d.findings = risks.evaluate(d)
+            d.name = store.lookup_name(names, d.mac, d.ip)
+        return out
+    return run_scan
+
+
+def test_names_appear_in_scan_output(monkeypatch, capsys, tmp_path):
+    store.save_names({"00:1A:2B:3C:4D:EE": "Projector"})
+    monkeypatch.setattr(cli, "run_scan", _fake_scan([{"ip": "192.168.1.238", "mac": "00:1A:2B:3C:4D:EE"}]))
+    out_json, out_html = tmp_path / "s.json", tmp_path / "s.html"
+    # No `scan` subcommand: a bare network means scan.
+    assert cli.main(["192.168.1.0/24", "-q", "--json", str(out_json), "--html", str(out_html)]) == 0
+    assert "Projector" in capsys.readouterr().out
+    assert json.loads(out_json.read_text())["devices"][0]["name"] == "Projector"
+    assert "<b>Projector</b>" in out_html.read_text()
