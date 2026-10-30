@@ -5,7 +5,7 @@ from datetime import datetime
 
 import pytest
 
-from netaudit import cli, discover, oui, report, risks, store
+from netaudit import cli, discover, history, oui, report, risks, store
 from netaudit import ports as portmod
 from netaudit.risks import Device, Finding
 
@@ -199,3 +199,44 @@ def test_names_appear_in_scan_output(monkeypatch, capsys, tmp_path):
     assert "Projector" in capsys.readouterr().out
     assert json.loads(out_json.read_text())["devices"][0]["name"] == "Projector"
     assert "<b>Projector</b>" in out_html.read_text()
+
+
+def _scanned(ip, mac="", ports=()):
+    d = Device(ip=ip, mac=mac, open_ports=list(ports))
+    d.findings = risks.evaluate(d)
+    return d
+
+
+def test_history_tracks_ips_and_only_snapshots_changes():
+    hist = {"devices": {}, "scans": []}
+    history.record(hist, [_scanned("192.168.1.20", "00:11:22:33:44:55", [80])], datetime(2026, 10, 1, 9), "net")
+    history.record(hist, [_scanned("192.168.1.20", "00:11:22:33:44:55", [80])], datetime(2026, 10, 2, 9), "net")
+    history.record(hist, [_scanned("192.168.1.21", "00:11:22:33:44:55", [80, 23])], datetime(2026, 10, 3, 9), "net")
+    e = hist["devices"]["00:11:22:33:44:55"]
+    assert (e["first_seen"], e["last_seen"], e["seen"]) == ("2026-10-01T09:00:00", "2026-10-03T09:00:00", 3)
+    assert [x["ip"] for x in e["ips"]] == ["192.168.1.20", "192.168.1.21"]
+    assert e["ips"][0]["last_seen"] == "2026-10-02T09:00:00"
+    assert len(e["snapshots"]) == 2  # the unchanged second scan adds nothing
+    last = history.timeline(e)[-1][1]
+    assert "IP 192.168.1.20 -> 192.168.1.21" in last and "opened 23" in last
+    assert any("Telnet" in x for x in last)
+    assert history.find(hist, "192.168.1.20", {}) and history.find(hist, "laptop", {"00:11:22:33:44:55": "Laptop"})
+
+
+def test_history_command_and_html_section(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cli, "run_scan", _fake_scan([{"ip": "192.168.1.77", "mac": "00:12:34:56:78:9A", "open_ports": [554]}]))
+    assert cli.main(["scan", "192.168.1.0/24", "-q"]) == 0
+    monkeypatch.setattr(cli, "run_scan", _fake_scan([{"ip": "192.168.1.77", "mac": "00:12:34:56:78:9A", "open_ports": [23, 554]}]))
+    page = tmp_path / "r.html"
+    assert cli.main(["scan", "192.168.1.0/24", "-q", "--html", str(page)]) == 0
+    assert "Device history" in page.read_text(encoding="utf-8") and "90 &rarr; 50" in page.read_text(encoding="utf-8")
+    store.save_names({"00:12:34:56:78:9A": "Camera"})
+    capsys.readouterr()
+    assert cli.main(["history"]) == 0
+    assert "Camera" in capsys.readouterr().out
+    assert cli.main(["history", "camera"]) == 0
+    out = capsys.readouterr().out
+    assert "in 2 scan(s)" in out and "opened 23" in out
+    assert cli.main(["history", "10.9.9.9"]) == 1
+    assert cli.main(["scan", "192.168.1.0/24", "-q", "--no-history"]) == 0
+    assert history.load()["devices"]["00:12:34:56:78:9A"]["seen"] == 2

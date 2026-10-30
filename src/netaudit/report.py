@@ -6,7 +6,7 @@ import html
 import json
 from datetime import datetime
 
-from netaudit import __version__
+from netaudit import __version__, history
 from netaudit.ports import COMMON_PORTS
 from netaudit.risks import Device
 
@@ -109,7 +109,8 @@ code{font-size:12px}ul{margin:4px 0;padding-left:18px}
 """
 
 
-def to_html(network: str, devices: list[Device], started: datetime, changes: dict | None = None) -> str:
+def to_html(network: str, devices: list[Device], started: datetime, changes: dict | None = None,
+            hist: dict | None = None) -> str:
     e = html.escape
     counts = {s: sum(1 for d in devices for f in d.findings if f.severity == s) for s in ("critical", "high", "medium")}
     avg = round(sum(d.score for d in devices) / len(devices)) if devices else 100
@@ -133,6 +134,7 @@ def to_html(network: str, devices: list[Device], started: datetime, changes: dic
         items += [f"<li>Gone: {e(d['ip'])}</li>" for d in changes["gone"]]
         items += [f"<li>Newly opened on {e(d['ip'])}: {e(', '.join(map(_port_label, d['new_ports'])))}</li>" for d in changes["new_ports"]]
         change_html = f"<h2>Changes since last scan</h2><ul>{''.join(items)}</ul>"
+    history_html = _history_html(devices, hist) if hist else ""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Network Audit {e(network)}</title>
 <style>{_CSS}</style></head><body><main>
@@ -145,8 +147,33 @@ def to_html(network: str, devices: list[Device], started: datetime, changes: dic
 {change_html}
 <div class="wrap"><table><thead><tr><th>Address</th><th>Name / vendor</th><th>Type</th><th>Open ports</th><th>Findings</th><th>Score</th></tr></thead>
 <tbody>{''.join(rows)}</tbody></table></div>
+{history_html}
 </main></body></html>
 """
+
+
+def _history_html(devices: list[Device], hist: dict) -> str:
+    e = html.escape
+    rows = []
+    for d in devices:
+        h = hist.get("devices", {}).get(history.device_id(d.mac, d.ip))
+        if not h:
+            continue
+        ips = list(dict.fromkeys(x["ip"] for x in h["ips"]))
+        scores = [str(s["score"]) for s in h["snapshots"][-8:]]
+        latest = history.timeline(h)[-1] if h["snapshots"] else None
+        change = f"{e(latest[0][:10])}: {e('; '.join(latest[1]))}" if latest else "-"
+        rows.append(
+            f"<tr><td><b>{e(d.name or d.ip)}</b>{'<br>' + e(d.ip) if d.name else ''}</td>"
+            f"<td>{e(h['first_seen'][:10])}<br><span class='muted'>{h['seen']} scan(s)</span></td>"
+            f"<td>{e(', '.join(ips))}</td><td>{' &rarr; '.join(scores)}</td>"
+            f"<td class='muted'>{change}</td></tr>"
+        )
+    if not rows:
+        return ""
+    return ("<h2>Device history</h2><div class='wrap'><table><thead><tr><th>Device</th><th>First seen</th>"
+            "<th>IP addresses used</th><th>Score trend</th><th>Latest change</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table></div>")
 
 
 def load(path: str) -> dict:

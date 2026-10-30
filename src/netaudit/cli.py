@@ -10,7 +10,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-from netaudit import __version__, discover, oui, report, store
+from netaudit import __version__, discover, history, oui, report, store
 from netaudit import ports as portmod
 from netaudit.risks import Device, evaluate, guess_kind
 
@@ -71,6 +71,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
     if not oui.have_registry():
         log("tip: run `netaudit update-oui` once to show device vendors.")
     devices = run_scan(net, port_spec, args, log)
+    hist = None
+    if not args.no_history:
+        hist = history.load()
+        history.record(hist, devices, started, str(net))
+        history.save(hist)
 
     changes = report.diff(report.load(args.baseline), devices) if args.baseline else None
     print(report.console(str(net), devices, changes))
@@ -82,7 +87,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
         log(f"JSON saved to {args.json}")
     if args.html:
         with open(args.html, "w", encoding="utf-8") as fh:
-            fh.write(report.to_html(str(net), devices, started, changes))
+            fh.write(report.to_html(str(net), devices, started, changes, hist))
         log(f"HTML report saved to {args.html}")
 
     if args.fail_on:
@@ -112,7 +117,7 @@ def cmd_name(args: argparse.Namespace) -> int:
             return 2
         if not store.is_mac(key):
             # Prefer the MAC behind an IP, so the name follows the device when its IP changes.
-            key = discover.arp_table().get(key) or key
+            key = discover.arp_table().get(key) or _mac_from_history(key) or key
 
     if args.remove:
         if names.pop(key, None) is None:
@@ -128,6 +133,26 @@ def cmd_name(args: argparse.Namespace) -> int:
     store.save_names(names)
     via = f" ({args.target})" if key != args.target else ""
     print(f"Named {key}{via}: {names[key]}")
+    return 0
+
+
+def _mac_from_history(ip: str) -> str:
+    for e in history.load().get("devices", {}).values():
+        if e.get("mac") and e["ips"] and e["ips"][-1]["ip"] == ip:
+            return e["mac"]
+    return ""
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    hist, names = history.load(), store.load_names()
+    if not args.device:
+        print(history.overview(hist, names), end="")
+        return 0
+    matches = history.find(hist, args.device, names)
+    if not matches:
+        print(f"error: no history for {args.device}", file=sys.stderr)
+        return 1
+    print("\n".join(history.detail(e, names) for _key, e in matches), end="")
     return 0
 
 
@@ -153,6 +178,7 @@ def _add_scan_args(s: argparse.ArgumentParser) -> None:
     s.add_argument("--allow-public", action="store_true", help="allow scanning non-private ranges you are authorized to test")
     s.add_argument("--force", action="store_true", help=f"allow ranges larger than {discover.MAX_HOSTS} addresses")
     s.add_argument("-q", "--quiet", action="store_true", help="only print the results")
+    s.add_argument("--no-history", action="store_true", help="do not record this scan in the device history")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -171,6 +197,10 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("name", nargs="?", help='the friendly name, e.g. "Living room TV"')
     n.add_argument("--remove", action="store_true", help="forget the name for this device")
     n.set_defaults(func=cmd_name)
+
+    h = sub.add_parser("history", help="show every device seen so far, or one device's timeline")
+    h.add_argument("device", nargs="?", help="IP, MAC or friendly name")
+    h.set_defaults(func=cmd_history)
 
     u = sub.add_parser("update-oui", help="download the IEEE MAC vendor list (about 6 MB, once)")
     u.set_defaults(func=cmd_update_oui)
