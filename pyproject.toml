@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Find every device on your home or office network and flag the risky ones."
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [{ name = "Hedi Trigui" }]
 keywords = ["network", "security", "audit", "inventory", "homelab", "sysadmin"]
 classifiers = [
